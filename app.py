@@ -242,17 +242,76 @@ def page_recipes():
                     st.warning("Malzeme adı boş olamaz.")
 
     with tab_new:
-        with st.form("new_recipe", clear_on_submit=True):
-            r_name = st.text_input("Reçete adı *", placeholder="Çikolatalı Tart")
-            r_servings = st.number_input("Kaç kişilik?", min_value=1, value=8, step=1)
-            r_notes = st.text_area("Notlar", placeholder="Glutensiz, Vegan vb.")
-            if st.form_submit_button("✅ Kaydet"):
-                if r_name.strip():
-                    add_recipe(r_name.strip(), int(r_servings), r_notes)
-                    st.success(f"'{r_name}' kaydedildi!")
+        # Session state ile sihirbaz adımlarını takip et
+        if "wizard_step" not in st.session_state:
+            st.session_state.wizard_step = 1
+        if "wizard_recipe_id" not in st.session_state:
+            st.session_state.wizard_recipe_id = None
+
+        # ── ADIM 1: Reçete bilgileri ──
+        if st.session_state.wizard_step == 1:
+            st.markdown("### 1️⃣ Reçete Bilgileri")
+            st.caption("Önce reçetenin temel bilgilerini girelim.")
+            with st.form("new_recipe", clear_on_submit=True):
+                r_name = st.text_input("Reçete adı *", placeholder="Çikolatalı Tart")
+                r_servings = st.number_input("Kaç kişilik?", min_value=1, value=8, step=1)
+                r_notes = st.text_area("Notlar", placeholder="Glutensiz, Vegan vb.")
+                if st.form_submit_button("Devam Et →"):
+                    if r_name.strip():
+                        new_id = add_recipe(r_name.strip(), int(r_servings), r_notes)
+                        st.session_state.wizard_recipe_id = new_id
+                        st.session_state.wizard_step = 2
+                        st.rerun()
+                    else:
+                        st.warning("Reçete adı zorunludur.")
+
+        # ── ADIM 2: Malzeme ekleme ──
+        elif st.session_state.wizard_step == 2:
+            recipe = get_recipe(st.session_state.wizard_recipe_id)
+            st.markdown(f"### 2️⃣ Malzeme Ekle — *{recipe['name']}*")
+            st.caption("İstediğin kadar malzeme ekle. Bitince 'Reçeteyi Tamamla' butonuna bas.")
+
+            ing_df = get_ingredients(st.session_state.wizard_recipe_id)
+            if not ing_df.empty:
+                show = ing_df[["name","quantity","unit","unit_price"]].copy()
+                show.columns = ["Malzeme","Miktar","Birim","Birim Fiyat (₺)"]
+                show["Maliyet (₺)"] = (ing_df["quantity"] * ing_df["unit_price"]).round(2)
+                st.dataframe(show, use_container_width=True, hide_index=True)
+                total = calculate_cost(ing_df)
+                st.metric("Toplam Maliyet", f"₺{total:,.2f}")
+            else:
+                st.info("Henüz malzeme eklenmedi.")
+
+            st.markdown("---")
+            with st.form("wizard_add_ing", clear_on_submit=True):
+                c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+                ing_name = c1.text_input("Malzeme adı", placeholder="Un")
+                ing_qty = c2.number_input("Miktar", min_value=0.0, step=0.1, value=100.0)
+                ing_unit = c3.selectbox("Birim", ["g","kg","ml","lt","adet","yemek k.","çay k.","su bardağı"])
+                ing_price = c4.number_input("Birim Fiyat (₺)", min_value=0.0, step=0.1)
+                if st.form_submit_button("➕ Malzeme Ekle"):
+                    if ing_name.strip():
+                        add_ingredient(st.session_state.wizard_recipe_id,
+                                       ing_name.strip(), ing_qty, ing_unit, ing_price)
+                        st.success(f"'{ing_name}' eklendi.")
+                        st.rerun()
+                    else:
+                        st.warning("Malzeme adı boş olamaz.")
+
+            st.markdown("---")
+            col_fin, col_cancel = st.columns([2, 1])
+            with col_fin:
+                if st.button("✅ Reçeteyi Tamamla", use_container_width=True):
+                    st.session_state.wizard_step = 1
+                    st.session_state.wizard_recipe_id = None
+                    st.success("Reçete kaydedildi! Reçeteler sekmesinden görebilirsin.")
                     st.rerun()
-                else:
-                    st.warning("Reçete adı zorunludur.")
+            with col_cancel:
+                if st.button("🗑️ İptal Et", use_container_width=True):
+                    delete_recipe(st.session_state.wizard_recipe_id)
+                    st.session_state.wizard_step = 1
+                    st.session_state.wizard_recipe_id = None
+                    st.rerun()
 
 
 # ─────────────────────────────────────────────
