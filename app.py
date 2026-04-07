@@ -171,75 +171,72 @@ def page_recipes():
     with tab_list:
         recipes_df = list_recipes()
         if recipes_df.empty:
-            st.info("Henüz reçete eklenmemiş.")
-            return
-
-        recipe_names = dict(zip(recipes_df["id"], recipes_df["name"]))
-        selected_id = st.selectbox("Reçete seçin", list(recipe_names.keys()),
-                                   format_func=lambda x: recipe_names[x])
-        recipe = get_recipe(selected_id)
-        if not recipe:
-            return
-
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            st.subheader(recipe["name"])
-            if recipe.get("notes"):
-                st.caption(f"📝 {recipe['notes']}")
-        with col2:
-            if st.button("🗑️ Reçeteyi Sil"):
-                delete_recipe(selected_id)
-                st.success("Silindi.")
-                st.rerun()
-
-        base_servings = recipe["servings"]
-        st.markdown('<p class="section-header">Dinamik Ölçeklendirme</p>', unsafe_allow_html=True)
-        target_servings = st.slider(f"Kişi sayısı (orijinal: {base_servings})",
-                                    1, max(200, base_servings * 10), base_servings)
-        scale = target_servings / base_servings
-
-        ing_df = get_ingredients(selected_id)
-        st.markdown('<p class="section-header">Malzemeler</p>', unsafe_allow_html=True)
-
-        if not ing_df.empty:
-            display_df = scale_ingredients(ing_df, scale)
-            display_df["Maliyet (₺)"] = (display_df["quantity"] * display_df["unit_price"]).round(2)
-            show_df = display_df.rename(columns={
-                "name": "Malzeme", "quantity": f"Miktar ({target_servings} kişi)",
-                "unit": "Birim", "unit_price": "Birim Fiyat (₺)",
-            })[["Malzeme", f"Miktar ({target_servings} kişi)", "Birim", "Birim Fiyat (₺)", "Maliyet (₺)"]]
-            st.dataframe(show_df, use_container_width=True, hide_index=True)
-
-            total = calculate_cost(ing_df, scale)
-            per_person = round(total / target_servings, 2) if target_servings else 0
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Toplam Maliyet", f"₺{total:,.2f}")
-            m2.metric("Kişi Başı Maliyet", f"₺{per_person:,.2f}")
-            m3.metric("Porsiyon Katsayısı", f"×{scale:.2f}")
-
-            with st.expander("Malzeme sil"):
-                ing_opts = dict(zip(ing_df["id"], ing_df["name"]))
-                del_id = st.selectbox("Silinecek", list(ing_opts.keys()), format_func=lambda x: ing_opts[x])
-                if st.button("Sil"):
-                    delete_ingredient(del_id)
-                    st.rerun()
+            st.info("Henüz reçete eklenmemiş. 'Yeni Reçete Ekle' sekmesini kullanın.")
         else:
-            st.info("Bu reçetede henüz malzeme yok.")
+            recipe_names = dict(zip(recipes_df["id"], recipes_df["name"]))
+            selected_id = st.selectbox("Reçete seçin", list(recipe_names.keys()),
+                                       format_func=lambda x: recipe_names[x])
+            recipe = get_recipe(selected_id)
+            if recipe:
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    st.subheader(recipe["name"])
+                    if recipe.get("notes"):
+                        st.caption(f"📝 {recipe['notes']}")
+                with col2:
+                    if st.button("🗑️ Reçeteyi Sil"):
+                        delete_recipe(selected_id)
+                        st.success("Silindi.")
+                        st.rerun()
 
-        st.markdown('<p class="section-header">Malzeme Ekle</p>', unsafe_allow_html=True)
-        with st.form("add_ing", clear_on_submit=True):
-            c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
-            ing_name = c1.text_input("Malzeme adı", placeholder="Un")
-            ing_qty = c2.number_input("Miktar", min_value=0.0, step=0.1, value=100.0)
-            ing_unit = c3.selectbox("Birim", ["g", "kg", "ml", "lt", "adet", "yemek k.", "çay k.", "su bardağı"])
-            ing_price = c4.number_input("Birim Fiyat (₺)", min_value=0.0, step=0.1)
-            if st.form_submit_button("➕ Ekle"):
-                if ing_name.strip():
-                    add_ingredient(selected_id, ing_name.strip(), ing_qty, ing_unit, ing_price)
-                    st.success(f"'{ing_name}' eklendi.")
-                    st.rerun()
+                base_servings = recipe["servings"]
+                st.markdown('<p class="section-header">Dinamik Ölçeklendirme</p>', unsafe_allow_html=True)
+                target_servings = st.slider(f"Kişi sayısı (orijinal: {base_servings})",
+                                            1, max(200, base_servings * 10), base_servings)
+                scale = target_servings / base_servings
+
+                ing_df = get_ingredients(selected_id)
+                st.markdown('<p class="section-header">Malzemeler</p>', unsafe_allow_html=True)
+
+                if not ing_df.empty:
+                    display_df = scale_ingredients(ing_df, scale)
+                    display_df["Maliyet (₺)"] = (display_df["quantity"] * display_df["unit_price"]).round(2)
+                    show_df = display_df.rename(columns={
+                        "name": "Malzeme", "quantity": f"Miktar ({target_servings} kişi)",
+                        "unit": "Birim", "unit_price": "Birim Fiyat (₺)",
+                    })[["Malzeme", f"Miktar ({target_servings} kişi)", "Birim", "Birim Fiyat (₺)", "Maliyet (₺)"]]
+                    st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+                    total = calculate_cost(ing_df, scale)
+                    per_person = round(total / target_servings, 2) if target_servings else 0
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Toplam Maliyet", f"₺{total:,.2f}")
+                    m2.metric("Kişi Başı Maliyet", f"₺{per_person:,.2f}")
+                    m3.metric("Porsiyon Katsayısı", f"×{scale:.2f}")
+
+                    with st.expander("Malzeme sil"):
+                        ing_opts = dict(zip(ing_df["id"], ing_df["name"]))
+                        del_id = st.selectbox("Silinecek", list(ing_opts.keys()), format_func=lambda x: ing_opts[x])
+                        if st.button("Sil"):
+                            delete_ingredient(del_id)
+                            st.rerun()
                 else:
-                    st.warning("Malzeme adı boş olamaz.")
+                    st.info("Bu reçetede henüz malzeme yok.")
+
+                st.markdown('<p class="section-header">Malzeme Ekle</p>', unsafe_allow_html=True)
+                with st.form("add_ing", clear_on_submit=True):
+                    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+                    ing_name = c1.text_input("Malzeme adı", placeholder="Un")
+                    ing_qty = c2.number_input("Miktar", min_value=0.0, step=0.1, value=100.0)
+                    ing_unit = c3.selectbox("Birim", ["g", "kg", "ml", "lt", "adet", "yemek k.", "çay k.", "su bardağı"])
+                    ing_price = c4.number_input("Birim Fiyat (₺)", min_value=0.0, step=0.1)
+                    if st.form_submit_button("➕ Ekle"):
+                        if ing_name.strip():
+                            add_ingredient(selected_id, ing_name.strip(), ing_qty, ing_unit, ing_price)
+                            st.success(f"'{ing_name}' eklendi.")
+                            st.rerun()
+                        else:
+                            st.warning("Malzeme adı boş olamaz.")
 
     with tab_new:
         # Session state ile sihirbaz adımlarını takip et
