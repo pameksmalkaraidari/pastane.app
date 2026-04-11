@@ -1,5 +1,9 @@
 import streamlit as st
 import pandas as pd
+import anthropic
+import base64
+import json
+import re
 from datetime import date
 from supabase import create_client, Client
 
@@ -47,6 +51,13 @@ h1, h2, h3 { color: #5a2d2d; }
     padding-bottom: 6px;
     margin-bottom: 16px;
 }
+.tip-box {
+    background-color: #fff8f0;
+    border-left: 4px solid #c97b5a;
+    border-radius: 0 8px 8px 0;
+    padding: 12px 16px;
+    margin: 8px 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -64,6 +75,14 @@ supabase = get_supabase()
 
 
 # ─────────────────────────────────────────────
+# ANTHROPIC İSTEMCİSİ
+# ─────────────────────────────────────────────
+@st.cache_resource
+def get_anthropic_client():
+    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+
+
+# ─────────────────────────────────────────────
 # VERİTABANI KATMANI
 # ─────────────────────────────────────────────
 
@@ -75,11 +94,26 @@ def get_recipe(recipe_id: int) -> dict | None:
     res = supabase.table("recipes").select("*").eq("id", recipe_id).single().execute()
     return res.data
 
-def add_recipe(name: str, servings: int, notes: str) -> int:
+def add_recipe(name: str, servings: int, notes: str, oven_temp: int | None,
+               oven_time: int | None, tips: str) -> int:
     res = supabase.table("recipes").insert({
-        "name": name, "servings": servings, "notes": notes
+        "name": name,
+        "servings": servings,
+        "notes": notes,
+        "oven_temp": oven_temp,
+        "oven_time": oven_time,
+        "tips": tips,
     }).execute()
     return res.data[0]["id"]
+
+def update_recipe_notes(recipe_id: int, notes: str, oven_temp: int | None,
+                        oven_time: int | None, tips: str):
+    supabase.table("recipes").update({
+        "notes": notes,
+        "oven_temp": oven_temp,
+        "oven_time": oven_time,
+        "tips": tips,
+    }).eq("id", recipe_id).execute()
 
 def delete_recipe(recipe_id: int):
     supabase.table("recipes").delete().eq("id", recipe_id).execute()
@@ -146,6 +180,59 @@ def scale_ingredients(df: pd.DataFrame, scale: float) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
+# FOTOĞRAFTAN MALZEME ÇIKARMA (CLAUDE VİSİON)
+# ─────────────────────────────────────────────
+
+def extract_ingredients_from_image(image_bytes: bytes, media_type: str) -> list[dict]:
+    """
+    Verilen görseli Claude Vision API'ye gönderir.
+    Dönen JSON: [{"name": "...", "quantity": 0.0, "unit": "...", "unit_price": 0.0}, ...]
+    """
+    client = get_anthropic_client()
+    b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    prompt = """Bu fotoğrafta bir tarif veya malzeme listesi var.
+Lütfen görüntüdeki TÜM malzemeleri çıkar ve SADECE aşağıdaki formatta JSON listesi döndür.
+Başka hiçbir metin ekleme, sadece JSON:
+
+[
+  {"name": "malzeme adı", "quantity": miktar_sayı, "unit": "birim", "unit_price": 0.0},
+  ...
+]
+
+Birim için şunları kullan: g, kg, ml, lt, adet, yemek k., çay k., su bardağı
+Miktar okunamazsa 0 yaz. Fiyat bilinmiyorsa 0.0 yaz.
+Türkçe malzeme adları kullan."""
+
+    message = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": b64,
+                        },
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ],
+    )
+
+    raw = message.content[0].text.strip()
+    # Olası ```json ... ``` sarmalayıcılarını temizle
+    raw = re.sub(r"^```[a-z]*\n?", "", raw)
+    raw = re.sub(r"\n?```$", "", raw)
+    return json.loads(raw)
+
+
+# ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
 
@@ -166,148 +253,246 @@ def render_sidebar():
 
 def page_recipes():
     st.title("📋 Reçete Defteri")
-    tab_list, tab_new = st.tabs(["Reçeteler", "Yeni Reçete Ekle"])
+    tab_list, tab_new, tab_photo = st.tabs(
+        ["Reçeteler", "Yeni Reçete Ekle", "📷 Fotoğraftan Ekle"]
+    )
 
+    # ── Mevcut reçeteler ──────────────────────
     with tab_list:
         recipes_df = list_recipes()
         if recipes_df.empty:
-            st.info("Henüz reçete eklenmemiş. 'Yeni Reçete Ekle' sekmesini kullanın.")
-        else:
-            recipe_names = dict(zip(recipes_df["id"], recipes_df["name"]))
-            selected_id = st.selectbox("Reçete seçin", list(recipe_names.keys()),
-                                       format_func=lambda x: recipe_names[x])
-            recipe = get_recipe(selected_id)
-            if recipe:
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    st.subheader(recipe["name"])
-                    if recipe.get("notes"):
-                        st.caption(f"📝 {recipe['notes']}")
-                with col2:
-                    if st.button("🗑️ Reçeteyi Sil"):
-                        delete_recipe(selected_id)
-                        st.success("Silindi.")
-                        st.rerun()
+            st.info("Henüz reçete eklenmemiş.")
+            return
 
-                base_servings = recipe["servings"]
-                st.markdown('<p class="section-header">Dinamik Ölçeklendirme</p>', unsafe_allow_html=True)
-                target_servings = st.slider(f"Kişi sayısı (orijinal: {base_servings})",
-                                            1, max(200, base_servings * 10), base_servings)
-                scale = target_servings / base_servings
+        recipe_names = dict(zip(recipes_df["id"], recipes_df["name"]))
+        selected_id = st.selectbox("Reçete seçin", list(recipe_names.keys()),
+                                   format_func=lambda x: recipe_names[x])
+        recipe = get_recipe(selected_id)
+        if not recipe:
+            return
 
-                ing_df = get_ingredients(selected_id)
-                st.markdown('<p class="section-header">Malzemeler</p>', unsafe_allow_html=True)
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.subheader(recipe["name"])
+        with col2:
+            if st.button("🗑️ Reçeteyi Sil"):
+                delete_recipe(selected_id)
+                st.success("Silindi.")
+                st.rerun()
 
-                if not ing_df.empty:
-                    display_df = scale_ingredients(ing_df, scale)
-                    display_df["Maliyet (₺)"] = (display_df["quantity"] * display_df["unit_price"]).round(2)
-                    show_df = display_df.rename(columns={
-                        "name": "Malzeme", "quantity": f"Miktar ({target_servings} kişi)",
-                        "unit": "Birim", "unit_price": "Birim Fiyat (₺)",
-                    })[["Malzeme", f"Miktar ({target_servings} kişi)", "Birim", "Birim Fiyat (₺)", "Maliyet (₺)"]]
-                    st.dataframe(show_df, use_container_width=True, hide_index=True)
+        # ── Notlar & Püf Noktaları ────────────
+        st.markdown('<p class="section-header">📝 Reçete Notları & Püf Noktaları</p>',
+                    unsafe_allow_html=True)
 
-                    total = calculate_cost(ing_df, scale)
-                    per_person = round(total / target_servings, 2) if target_servings else 0
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric("Toplam Maliyet", f"₺{total:,.2f}")
-                    m2.metric("Kişi Başı Maliyet", f"₺{per_person:,.2f}")
-                    m3.metric("Porsiyon Katsayısı", f"×{scale:.2f}")
+        oven_temp = recipe.get("oven_temp")
+        oven_time = recipe.get("oven_time")
+        tips      = recipe.get("tips", "")
+        notes     = recipe.get("notes", "")
 
-                    with st.expander("Malzeme sil"):
-                        ing_opts = dict(zip(ing_df["id"], ing_df["name"]))
-                        del_id = st.selectbox("Silinecek", list(ing_opts.keys()), format_func=lambda x: ing_opts[x])
-                        if st.button("Sil"):
-                            delete_ingredient(del_id)
-                            st.rerun()
-                else:
-                    st.info("Bu reçetede henüz malzeme yok.")
+        # Göster
+        info_cols = st.columns(3)
+        if oven_temp:
+            info_cols[0].metric("🌡️ Fırın Derecesi", f"{oven_temp} °C")
+        if oven_time:
+            info_cols[1].metric("⏱️ Pişirme Süresi", f"{oven_time} dk")
+        if notes:
+            info_cols[2].markdown(f'<div class="tip-box">📌 {notes}</div>',
+                                  unsafe_allow_html=True)
+        if tips:
+            st.markdown(f'<div class="tip-box">💡 <b>Püf Noktaları:</b><br>{tips}</div>',
+                        unsafe_allow_html=True)
 
-                st.markdown('<p class="section-header">Malzeme Ekle</p>', unsafe_allow_html=True)
-                with st.form("add_ing", clear_on_submit=True):
-                    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
-                    ing_name = c1.text_input("Malzeme adı", placeholder="Un")
-                    ing_qty = c2.number_input("Miktar", min_value=0.0, step=0.1, value=100.0)
-                    ing_unit = c3.selectbox("Birim", ["g", "kg", "ml", "lt", "adet", "yemek k.", "çay k.", "su bardağı"])
-                    ing_price = c4.number_input("Birim Fiyat (₺)", min_value=0.0, step=0.1)
-                    if st.form_submit_button("➕ Ekle"):
-                        if ing_name.strip():
-                            add_ingredient(selected_id, ing_name.strip(), ing_qty, ing_unit, ing_price)
-                            st.success(f"'{ing_name}' eklendi.")
-                            st.rerun()
-                        else:
-                            st.warning("Malzeme adı boş olamaz.")
-
-    with tab_new:
-        # Session state ile sihirbaz adımlarını takip et
-        if "wizard_step" not in st.session_state:
-            st.session_state.wizard_step = 1
-        if "wizard_recipe_id" not in st.session_state:
-            st.session_state.wizard_recipe_id = None
-
-        # ── ADIM 1: Reçete bilgileri ──
-        if st.session_state.wizard_step == 1:
-            st.markdown("### 1️⃣ Reçete Bilgileri")
-            st.caption("Önce reçetenin temel bilgilerini girelim.")
-            with st.form("new_recipe", clear_on_submit=True):
-                r_name = st.text_input("Reçete adı *", placeholder="Çikolatalı Tart")
-                r_servings = st.number_input("Kaç kişilik?", min_value=1, value=8, step=1)
-                r_notes = st.text_area("Notlar", placeholder="Glutensiz, Vegan vb.")
-                if st.form_submit_button("Devam Et →"):
-                    if r_name.strip():
-                        new_id = add_recipe(r_name.strip(), int(r_servings), r_notes)
-                        st.session_state.wizard_recipe_id = new_id
-                        st.session_state.wizard_step = 2
-                        st.rerun()
-                    else:
-                        st.warning("Reçete adı zorunludur.")
-
-        # ── ADIM 2: Malzeme ekleme ──
-        elif st.session_state.wizard_step == 2:
-            recipe = get_recipe(st.session_state.wizard_recipe_id)
-            st.markdown(f"### 2️⃣ Malzeme Ekle — *{recipe['name']}*")
-            st.caption("İstediğin kadar malzeme ekle. Bitince 'Reçeteyi Tamamla' butonuna bas.")
-
-            ing_df = get_ingredients(st.session_state.wizard_recipe_id)
-            if not ing_df.empty:
-                show = ing_df[["name","quantity","unit","unit_price"]].copy()
-                show.columns = ["Malzeme","Miktar","Birim","Birim Fiyat (₺)"]
-                show["Maliyet (₺)"] = (ing_df["quantity"] * ing_df["unit_price"]).round(2)
-                st.dataframe(show, use_container_width=True, hide_index=True)
-                total = calculate_cost(ing_df)
-                st.metric("Toplam Maliyet", f"₺{total:,.2f}")
-            else:
-                st.info("Henüz malzeme eklenmedi.")
-
-            st.markdown("---")
-            with st.form("wizard_add_ing", clear_on_submit=True):
-                c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
-                ing_name = c1.text_input("Malzeme adı", placeholder="Un")
-                ing_qty = c2.number_input("Miktar", min_value=0.0, step=0.1, value=100.0)
-                ing_unit = c3.selectbox("Birim", ["g","kg","ml","lt","adet","yemek k.","çay k.","su bardağı"])
-                ing_price = c4.number_input("Birim Fiyat (₺)", min_value=0.0, step=0.1)
-                if st.form_submit_button("➕ Malzeme Ekle"):
-                    if ing_name.strip():
-                        add_ingredient(st.session_state.wizard_recipe_id,
-                                       ing_name.strip(), ing_qty, ing_unit, ing_price)
-                        st.success(f"'{ing_name}' eklendi.")
-                        st.rerun()
-                    else:
-                        st.warning("Malzeme adı boş olamaz.")
-
-            st.markdown("---")
-            col_fin, col_cancel = st.columns([2, 1])
-            with col_fin:
-                if st.button("✅ Reçeteyi Tamamla", use_container_width=True):
-                    st.session_state.wizard_step = 1
-                    st.session_state.wizard_recipe_id = None
-                    st.success("Reçete kaydedildi! Reçeteler sekmesinden görebilirsin.")
+        with st.expander("✏️ Notları Düzenle"):
+            with st.form("edit_notes"):
+                en_temp  = st.number_input("Fırın Derecesi (°C)", min_value=0, max_value=300,
+                                           value=int(oven_temp) if oven_temp else 0, step=5)
+                en_time  = st.number_input("Pişirme Süresi (dakika)", min_value=0, max_value=600,
+                                           value=int(oven_time) if oven_time else 0, step=5)
+                en_notes = st.text_input("Genel Not", value=notes or "",
+                                         placeholder="Glutensiz, Vegan, Soğuk servis vb.")
+                en_tips  = st.text_area("Püf Noktaları",
+                                        value=tips or "",
+                                        placeholder="• Tereyağı oda sıcaklığında olmalı\n• Hamur 30 dk dinlenmeli",
+                                        height=120)
+                if st.form_submit_button("💾 Kaydet"):
+                    update_recipe_notes(
+                        selected_id,
+                        en_notes,
+                        int(en_temp) if en_temp else None,
+                        int(en_time) if en_time else None,
+                        en_tips,
+                    )
+                    st.success("Notlar güncellendi!")
                     st.rerun()
-            with col_cancel:
-                if st.button("🗑️ İptal Et", use_container_width=True):
-                    delete_recipe(st.session_state.wizard_recipe_id)
-                    st.session_state.wizard_step = 1
-                    st.session_state.wizard_recipe_id = None
+
+        # ── Dinamik Ölçeklendirme ─────────────
+        base_servings = recipe["servings"]
+        st.markdown('<p class="section-header">Dinamik Ölçeklendirme</p>', unsafe_allow_html=True)
+        target_servings = st.slider(f"Kişi sayısı (orijinal: {base_servings})",
+                                    1, max(200, base_servings * 10), base_servings)
+        scale = target_servings / base_servings
+
+        ing_df = get_ingredients(selected_id)
+        st.markdown('<p class="section-header">Malzemeler</p>', unsafe_allow_html=True)
+
+        if not ing_df.empty:
+            display_df = scale_ingredients(ing_df, scale)
+            display_df["Maliyet (₺)"] = (display_df["quantity"] * display_df["unit_price"]).round(2)
+            show_df = display_df.rename(columns={
+                "name": "Malzeme", "quantity": f"Miktar ({target_servings} kişi)",
+                "unit": "Birim", "unit_price": "Birim Fiyat (₺)",
+            })[["Malzeme", f"Miktar ({target_servings} kişi)", "Birim", "Birim Fiyat (₺)", "Maliyet (₺)"]]
+            st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+            total = calculate_cost(ing_df, scale)
+            per_person = round(total / target_servings, 2) if target_servings else 0
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Toplam Maliyet", f"₺{total:,.2f}")
+            m2.metric("Kişi Başı Maliyet", f"₺{per_person:,.2f}")
+            m3.metric("Porsiyon Katsayısı", f"×{scale:.2f}")
+
+            with st.expander("Malzeme sil"):
+                ing_opts = dict(zip(ing_df["id"], ing_df["name"]))
+                del_id = st.selectbox("Silinecek", list(ing_opts.keys()),
+                                      format_func=lambda x: ing_opts[x])
+                if st.button("Sil"):
+                    delete_ingredient(del_id)
+                    st.rerun()
+        else:
+            st.info("Bu reçetede henüz malzeme yok.")
+
+        st.markdown('<p class="section-header">Malzeme Ekle</p>', unsafe_allow_html=True)
+        with st.form("add_ing", clear_on_submit=True):
+            c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+            ing_name  = c1.text_input("Malzeme adı", placeholder="Un")
+            ing_qty   = c2.number_input("Miktar", min_value=0.0, step=0.1, value=100.0)
+            ing_unit  = c3.selectbox("Birim", ["g", "kg", "ml", "lt", "adet",
+                                                "yemek k.", "çay k.", "su bardağı"])
+            ing_price = c4.number_input("Birim Fiyat (₺)", min_value=0.0, step=0.1)
+            if st.form_submit_button("➕ Ekle"):
+                if ing_name.strip():
+                    add_ingredient(selected_id, ing_name.strip(), ing_qty, ing_unit, ing_price)
+                    st.success(f"'{ing_name}' eklendi.")
+                    st.rerun()
+                else:
+                    st.warning("Malzeme adı boş olamaz.")
+
+    # ── Yeni reçete (manuel) ──────────────────
+    with tab_new:
+        with st.form("new_recipe", clear_on_submit=True):
+            r_name     = st.text_input("Reçete adı *", placeholder="Çikolatalı Tart")
+            r_servings = st.number_input("Kaç kişilik?", min_value=1, value=8, step=1)
+            r_notes    = st.text_input("Genel Not", placeholder="Glutensiz, Vegan vb.")
+
+            st.markdown("**🌡️ Pişirme Bilgileri**")
+            pc1, pc2 = st.columns(2)
+            r_oven_temp = pc1.number_input("Fırın Derecesi (°C)", min_value=0,
+                                           max_value=300, value=0, step=5,
+                                           help="0 girerseniz kaydedilmez")
+            r_oven_time = pc2.number_input("Pişirme Süresi (dakika)", min_value=0,
+                                           max_value=600, value=0, step=5,
+                                           help="0 girerseniz kaydedilmez")
+            r_tips = st.text_area("💡 Püf Noktaları",
+                                   placeholder="• Tereyağı mutlaka oda sıcaklığında olmalı\n"
+                                               "• Hamuru yoğururken aşırı bastırmayın",
+                                   height=120)
+
+            if st.form_submit_button("✅ Kaydet"):
+                if r_name.strip():
+                    add_recipe(
+                        r_name.strip(), int(r_servings), r_notes,
+                        int(r_oven_temp) if r_oven_temp else None,
+                        int(r_oven_time) if r_oven_time else None,
+                        r_tips,
+                    )
+                    st.success(f"'{r_name}' kaydedildi!")
+                    st.rerun()
+                else:
+                    st.warning("Reçete adı zorunludur.")
+
+    # ── Fotoğraftan ekle ──────────────────────
+    with tab_photo:
+        st.markdown("### 📷 Fotoğraftan Malzeme Çıkar")
+        st.info(
+            "Tarif kartınızın, notebook sayfanızın veya herhangi bir malzeme listesinin "
+            "fotoğrafını yükleyin. Claude yapay zekası malzemeleri otomatik okuyacak."
+        )
+
+        recipes_df2 = list_recipes()
+        if recipes_df2.empty:
+            st.warning("Önce bir reçete oluşturun, ardından fotoğraftan malzeme ekleyebilirsiniz.")
+        else:
+            recipe_names2 = dict(zip(recipes_df2["id"], recipes_df2["name"]))
+            photo_recipe_id = st.selectbox(
+                "Hangi reçeteye eklensin?",
+                list(recipe_names2.keys()),
+                format_func=lambda x: recipe_names2[x],
+                key="photo_recipe_select",
+            )
+
+            uploaded_file = st.file_uploader(
+                "Tarif fotoğrafı yükle",
+                type=["jpg", "jpeg", "png", "webp"],
+                help="Yazıların net göründüğü bir fotoğraf seçin.",
+            )
+
+            if uploaded_file:
+                st.image(uploaded_file, caption="Yüklenen Fotoğraf", use_column_width=True)
+
+                if st.button("🔍 Malzemeleri Çıkar", type="primary"):
+                    ext = uploaded_file.name.rsplit(".", 1)[-1].lower()
+                    mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                                "png": "image/png", "webp": "image/webp"}
+                    media_type = mime_map.get(ext, "image/jpeg")
+
+                    with st.spinner("Claude malzemeleri okuyor…"):
+                        try:
+                            extracted = extract_ingredients_from_image(
+                                uploaded_file.getvalue(), media_type
+                            )
+                            st.session_state["extracted_ingredients"] = extracted
+                            st.session_state["photo_recipe_id"] = photo_recipe_id
+                        except Exception as e:
+                            st.error(f"Malzeme çıkarılamadı: {e}")
+
+            # Çıkarılan malzemeleri göster & düzenle
+            if "extracted_ingredients" in st.session_state:
+                st.markdown("#### ✅ Çıkarılan Malzemeler — Kontrol & Kaydet")
+                st.caption("Aşağıdaki bilgileri düzenleyebilir, istemediğinizi kaldırabilirsiniz.")
+
+                extracted: list[dict] = st.session_state["extracted_ingredients"]
+                valid_units = ["g", "kg", "ml", "lt", "adet",
+                               "yemek k.", "çay k.", "su bardağı"]
+
+                edited_rows = []
+                for idx, ing in enumerate(extracted):
+                    cols = st.columns([3, 2, 2, 2, 1])
+                    name  = cols[0].text_input("Ad",    value=ing.get("name", ""),   key=f"n{idx}")
+                    qty   = cols[1].number_input("Miktar", min_value=0.0, step=0.1,
+                                                  value=float(ing.get("quantity", 0)),
+                                                  key=f"q{idx}")
+                    raw_unit = ing.get("unit", "g")
+                    unit_val = raw_unit if raw_unit in valid_units else "g"
+                    unit  = cols[2].selectbox("Birim", valid_units,
+                                              index=valid_units.index(unit_val),
+                                              key=f"u{idx}")
+                    price = cols[3].number_input("Birim Fiyat (₺)", min_value=0.0, step=0.1,
+                                                  value=float(ing.get("unit_price", 0)),
+                                                  key=f"p{idx}")
+                    keep  = cols[4].checkbox("✓", value=True, key=f"k{idx}")
+                    if keep and name.strip():
+                        edited_rows.append({"name": name.strip(), "quantity": qty,
+                                            "unit": unit, "unit_price": price})
+
+                if st.button("💾 Seçilen Malzemeleri Kaydet", type="primary"):
+                    target_id = st.session_state.get("photo_recipe_id", photo_recipe_id)
+                    saved = 0
+                    for row in edited_rows:
+                        add_ingredient(target_id, row["name"], row["quantity"],
+                                       row["unit"], row["unit_price"])
+                        saved += 1
+                    st.success(f"{saved} malzeme '{recipe_names2[target_id]}' reçetesine eklendi!")
+                    del st.session_state["extracted_ingredients"]
                     st.rerun()
 
 
@@ -349,7 +534,8 @@ def page_orders():
                 oid = st.number_input("Sipariş ID", min_value=1, step=1)
                 ca, cb = st.columns(2)
                 with ca:
-                    ns = st.selectbox("Yeni durum", ["Bekliyor", "Hazırlanıyor", "Teslim Edildi", "İptal"])
+                    ns = st.selectbox("Yeni durum", ["Bekliyor", "Hazırlanıyor",
+                                                      "Teslim Edildi", "İptal"])
                     if st.button("Durumu Güncelle"):
                         update_order_status(int(oid), ns)
                         st.success("Güncellendi!")
@@ -371,11 +557,11 @@ def page_orders():
         with st.form("new_order", clear_on_submit=True):
             o_customer = st.text_input("Müşteri adı *", placeholder="Ayşe Hanım")
             o_delivery = st.date_input("Teslimat tarihi *", value=date.today())
-            o_theme = st.text_input("Pasta teması", placeholder="Doğum günü, Düğün...")
-            o_recipe = st.selectbox("Reçete (opsiyonel)", list(recipe_options.keys()))
+            o_theme    = st.text_input("Pasta teması", placeholder="Doğum günü, Düğün...")
+            o_recipe   = st.selectbox("Reçete (opsiyonel)", list(recipe_options.keys()))
             o_servings = st.number_input("Kişi sayısı", min_value=1, value=10, step=1)
-            o_notes = st.text_area("Özel notlar / Alerjen uyarıları",
-                                   placeholder="Fındık alerjisi var...")
+            o_notes    = st.text_area("Özel notlar / Alerjen uyarıları",
+                                      placeholder="Fındık alerjisi var...")
             if st.form_submit_button("✅ Siparişi Kaydet"):
                 if o_customer.strip():
                     add_order(o_customer.strip(), str(o_delivery), o_theme,
@@ -392,7 +578,7 @@ def page_orders():
 
 def page_summary():
     st.title("📊 Özet")
-    orders_df = list_orders()
+    orders_df  = list_orders()
     recipes_df = list_recipes()
 
     c1, c2, c3, c4 = st.columns(4)
@@ -405,7 +591,7 @@ def page_summary():
 
         st.markdown("---")
         st.subheader("Yaklaşan Teslimatlar (7 gün)")
-        today_str = date.today().isoformat()
+        today_str  = date.today().isoformat()
         week_later = date.fromordinal(date.today().toordinal() + 7).isoformat()
         upcoming = orders_df[
             (orders_df["delivery_date"] >= today_str) &
