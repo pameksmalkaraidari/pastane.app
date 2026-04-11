@@ -1,9 +1,5 @@
 import streamlit as st
 import pandas as pd
-import anthropic
-import base64
-import json
-import re
 from datetime import date
 from supabase import create_client, Client
 
@@ -72,14 +68,6 @@ def get_supabase() -> Client:
     return create_client(url, key)
 
 supabase = get_supabase()
-
-
-# ─────────────────────────────────────────────
-# ANTHROPIC İSTEMCİSİ
-# ─────────────────────────────────────────────
-@st.cache_resource
-def get_anthropic_client():
-    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
 
 # ─────────────────────────────────────────────
@@ -180,59 +168,6 @@ def scale_ingredients(df: pd.DataFrame, scale: float) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────
-# FOTOĞRAFTAN MALZEME ÇIKARMA (CLAUDE VİSİON)
-# ─────────────────────────────────────────────
-
-def extract_ingredients_from_image(image_bytes: bytes, media_type: str) -> list[dict]:
-    """
-    Verilen görseli Claude Vision API'ye gönderir.
-    Dönen JSON: [{"name": "...", "quantity": 0.0, "unit": "...", "unit_price": 0.0}, ...]
-    """
-    client = get_anthropic_client()
-    b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-
-    prompt = """Bu fotoğrafta bir tarif veya malzeme listesi var.
-Lütfen görüntüdeki TÜM malzemeleri çıkar ve SADECE aşağıdaki formatta JSON listesi döndür.
-Başka hiçbir metin ekleme, sadece JSON:
-
-[
-  {"name": "malzeme adı", "quantity": miktar_sayı, "unit": "birim", "unit_price": 0.0},
-  ...
-]
-
-Birim için şunları kullan: g, kg, ml, lt, adet, yemek k., çay k., su bardağı
-Miktar okunamazsa 0 yaz. Fiyat bilinmiyorsa 0.0 yaz.
-Türkçe malzeme adları kullan."""
-
-    message = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=1024,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": b64,
-                        },
-                    },
-                    {"type": "text", "text": prompt},
-                ],
-            }
-        ],
-    )
-
-    raw = message.content[0].text.strip()
-    # Olası ```json ... ``` sarmalayıcılarını temizle
-    raw = re.sub(r"^```[a-z]*\n?", "", raw)
-    raw = re.sub(r"\n?```$", "", raw)
-    return json.loads(raw)
-
-
-# ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
 
@@ -253,9 +188,7 @@ def render_sidebar():
 
 def page_recipes():
     st.title("📋 Reçete Defteri")
-    tab_list, tab_new, tab_photo = st.tabs(
-        ["Reçeteler", "Yeni Reçete Ekle", "📷 Fotoğraftan Ekle"]
-    )
+    tab_list, tab_new = st.tabs(["Reçeteler", "Yeni Reçete Ekle"])
 
     # ── Mevcut reçeteler ──────────────────────
     with tab_list:
@@ -289,7 +222,6 @@ def page_recipes():
         tips      = recipe.get("tips", "")
         notes     = recipe.get("notes", "")
 
-        # Göster
         info_cols = st.columns(3)
         if oven_temp:
             info_cols[0].metric("🌡️ Fırın Derecesi", f"{oven_temp} °C")
@@ -377,7 +309,7 @@ def page_recipes():
                 else:
                     st.warning("Malzeme adı boş olamaz.")
 
-    # ── Yeni reçete (manuel) ──────────────────
+    # ── Yeni reçete ───────────────────────────
     with tab_new:
         with st.form("new_recipe", clear_on_submit=True):
             r_name     = st.text_input("Reçete adı *", placeholder="Çikolatalı Tart")
@@ -409,91 +341,6 @@ def page_recipes():
                     st.rerun()
                 else:
                     st.warning("Reçete adı zorunludur.")
-
-    # ── Fotoğraftan ekle ──────────────────────
-    with tab_photo:
-        st.markdown("### 📷 Fotoğraftan Malzeme Çıkar")
-        st.info(
-            "Tarif kartınızın, notebook sayfanızın veya herhangi bir malzeme listesinin "
-            "fotoğrafını yükleyin. Claude yapay zekası malzemeleri otomatik okuyacak."
-        )
-
-        recipes_df2 = list_recipes()
-        if recipes_df2.empty:
-            st.warning("Önce bir reçete oluşturun, ardından fotoğraftan malzeme ekleyebilirsiniz.")
-        else:
-            recipe_names2 = dict(zip(recipes_df2["id"], recipes_df2["name"]))
-            photo_recipe_id = st.selectbox(
-                "Hangi reçeteye eklensin?",
-                list(recipe_names2.keys()),
-                format_func=lambda x: recipe_names2[x],
-                key="photo_recipe_select",
-            )
-
-            uploaded_file = st.file_uploader(
-                "Tarif fotoğrafı yükle",
-                type=["jpg", "jpeg", "png", "webp"],
-                help="Yazıların net göründüğü bir fotoğraf seçin.",
-            )
-
-            if uploaded_file:
-                st.image(uploaded_file, caption="Yüklenen Fotoğraf", use_column_width=True)
-
-                if st.button("🔍 Malzemeleri Çıkar", type="primary"):
-                    ext = uploaded_file.name.rsplit(".", 1)[-1].lower()
-                    mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                                "png": "image/png", "webp": "image/webp"}
-                    media_type = mime_map.get(ext, "image/jpeg")
-
-                    with st.spinner("Claude malzemeleri okuyor…"):
-                        try:
-                            extracted = extract_ingredients_from_image(
-                                uploaded_file.getvalue(), media_type
-                            )
-                            st.session_state["extracted_ingredients"] = extracted
-                            st.session_state["photo_recipe_id"] = photo_recipe_id
-                        except Exception as e:
-                            st.error(f"Malzeme çıkarılamadı: {e}")
-
-            # Çıkarılan malzemeleri göster & düzenle
-            if "extracted_ingredients" in st.session_state:
-                st.markdown("#### ✅ Çıkarılan Malzemeler — Kontrol & Kaydet")
-                st.caption("Aşağıdaki bilgileri düzenleyebilir, istemediğinizi kaldırabilirsiniz.")
-
-                extracted: list[dict] = st.session_state["extracted_ingredients"]
-                valid_units = ["g", "kg", "ml", "lt", "adet",
-                               "yemek k.", "çay k.", "su bardağı"]
-
-                edited_rows = []
-                for idx, ing in enumerate(extracted):
-                    cols = st.columns([3, 2, 2, 2, 1])
-                    name  = cols[0].text_input("Ad",    value=ing.get("name", ""),   key=f"n{idx}")
-                    qty   = cols[1].number_input("Miktar", min_value=0.0, step=0.1,
-                                                  value=float(ing.get("quantity", 0)),
-                                                  key=f"q{idx}")
-                    raw_unit = ing.get("unit", "g")
-                    unit_val = raw_unit if raw_unit in valid_units else "g"
-                    unit  = cols[2].selectbox("Birim", valid_units,
-                                              index=valid_units.index(unit_val),
-                                              key=f"u{idx}")
-                    price = cols[3].number_input("Birim Fiyat (₺)", min_value=0.0, step=0.1,
-                                                  value=float(ing.get("unit_price", 0)),
-                                                  key=f"p{idx}")
-                    keep  = cols[4].checkbox("✓", value=True, key=f"k{idx}")
-                    if keep and name.strip():
-                        edited_rows.append({"name": name.strip(), "quantity": qty,
-                                            "unit": unit, "unit_price": price})
-
-                if st.button("💾 Seçilen Malzemeleri Kaydet", type="primary"):
-                    target_id = st.session_state.get("photo_recipe_id", photo_recipe_id)
-                    saved = 0
-                    for row in edited_rows:
-                        add_ingredient(target_id, row["name"], row["quantity"],
-                                       row["unit"], row["unit_price"])
-                        saved += 1
-                    st.success(f"{saved} malzeme '{recipe_names2[target_id]}' reçetesine eklendi!")
-                    del st.session_state["extracted_ingredients"]
-                    st.rerun()
 
 
 # ─────────────────────────────────────────────
